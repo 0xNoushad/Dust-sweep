@@ -20,6 +20,13 @@ const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const JUPITER_QUOTE_API = "https://quote-api.jup.ag/v4/quote";
 const JUPITER_SWAP_API = "https://quote-api.jup.ag/v4/swap";
 
+// Define the headers with the correct X-Action-Version and X-Blockchain-Ids
+const ACTION_HEADERS = {
+  'X-Action-Version': '2.1.3',  // Update the version as per your setup
+  'X-Blockchain-Ids': 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp',  // Solana Mainnet
+  ...ACTIONS_CORS_HEADERS,  // Your existing CORS headers
+};
+
 // GET endpoint for action metadata
 export async function GET(request: Request) {
   const url = new URL(request.url);
@@ -41,7 +48,7 @@ export async function GET(request: Request) {
   };
 
   return Response.json(payload, {
-    headers: ACTIONS_CORS_HEADERS,
+    headers: ACTION_HEADERS,
   });
 }
 
@@ -58,7 +65,7 @@ export async function POST(request: Request) {
     if (action !== "sweep") {
       return Response.json(
         { error: { message: "Invalid action" } },
-        { status: 400, headers: ACTIONS_CORS_HEADERS }
+        { status: 400, headers: ACTION_HEADERS }
       );
     }
 
@@ -70,7 +77,7 @@ export async function POST(request: Request) {
       console.log(error);
       return Response.json(
         { error: { message: "Invalid account" } },
-        { status: 400, headers: ACTIONS_CORS_HEADERS }
+        { status: 400, headers: ACTION_HEADERS }
       );
     }
 
@@ -91,7 +98,9 @@ export async function POST(request: Request) {
       if (amount > 0) {
         try {
           // Get token price from Jupiter
-          const priceResponse = await axios.get(`https://price.jup.ag/v4/price?ids=${parsedInfo.mint}`);
+          const priceResponse = await axios.get(`https://price.jup.ag/v4/price?ids=${parsedInfo.mint}`, {
+            headers: ACTION_HEADERS,  // Include headers in this request
+          });
           const price = priceResponse.data.data[parsedInfo.mint]?.price || 0;
           const value = price * amount;
 
@@ -121,6 +130,7 @@ export async function POST(request: Request) {
             amount: token.amount.toString(),
             slippageBps: 50,
           },
+          headers: ACTION_HEADERS,  // Include headers in this request
         });
 
         // Get swap transaction
@@ -128,6 +138,8 @@ export async function POST(request: Request) {
           quoteResponse: quoteResponse.data,
           userPublicKey: sender.toString(),
           wrapUnwrapSOL: true,
+        }, {
+          headers: ACTION_HEADERS,  // Include headers in this request
         });
 
         // Add swap instruction to transaction
@@ -157,14 +169,14 @@ export async function POST(request: Request) {
     });
 
     return new Response(JSON.stringify(payload), {
-      headers: ACTIONS_CORS_HEADERS,
+      headers: ACTION_HEADERS,
     });
 
   } catch (error) {
     console.error("Error processing request:", error);
     return Response.json(
       { error: { message: "An unexpected error occurred" } },
-      { status: 500, headers: ACTIONS_CORS_HEADERS }
+      { status: 500, headers: ACTION_HEADERS }
     );
   }
 }
