@@ -14,7 +14,7 @@ import {
   ParsedAccountData,
 } from "@solana/web3.js";
 
-import axios, { AxiosError } from 'axios';
+import axios from 'axios';
 import { setTimeout } from 'timers/promises';
 
 const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
