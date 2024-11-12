@@ -11,35 +11,74 @@ import {
   PublicKey,
   Transaction,
   clusterApiUrl,
+  ParsedAccountData,
 } from "@solana/web3.js";
 
-import axios from 'axios';
+import axios, { AxiosError } from 'axios';
+import { setTimeout } from 'timers/promises';
 
-// Constants
 const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const JUPITER_QUOTE_API = "https://quote-api.jup.ag/v4/quote";
 const JUPITER_SWAP_API = "https://quote-api.jup.ag/v4/swap";
 
-// Define the headers with the correct X-Action-Version and X-Blockchain-Ids
 const ACTION_HEADERS = {
-  'X-Action-Version': '2.1.3',  // Update the version as per your setup
-  'X-Blockchain-Ids': 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp',  // Solana Mainnet
-  ...ACTIONS_CORS_HEADERS,  // Your existing CORS headers
+  'X-Action-Version': '2.1.3',
+  'X-Blockchain-Ids': 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp',   
+  ...ACTIONS_CORS_HEADERS,
 };
 
-// GET endpoint for action metadata
-export async function GET(request: Request) {
+// Interfaces
+interface TokenAccount {
+  pubkey: PublicKey;
+  account: {
+    data: ParsedAccountData;
+  };
+}
+
+interface DustToken {
+  mint: string;
+  amount: number;
+  uiAmount: number;
+  value: number;
+}
+ 
+async function retryWithBackoff<T>(
+  fn: () => Promise<T>,
+  maxRetries = 5,
+  delay = 1000
+): Promise<T> {
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      return await fn();
+    } catch (error) {
+      if (i === maxRetries - 1) throw error;
+      if (axios.isAxiosError(error) && error.response?.status === 429) {
+        await setTimeout(delay * Math.pow(2, i));
+      } else {
+        throw error;
+      }
+    }
+  }
+  throw new Error("Max retries reached");
+}
+
+export async function GET(request: Request): Promise<Response> {
   const url = new URL(request.url);
 
   const payload: ActionGetResponse = {
     icon: "https://raw.githubusercontent.com/your-repo/dust-sweeper-icon.png",
     title: "Dust Token Sweeper",
-    description: "Automatically swap dust tokens (worth < $5) to USDC using Jupiter",
+    description: "Swap tokens worth ≤ $5 to USDC using Jupiter",
     label: "Sweep Dust",
     links: {
       actions: [
         {
-          label: "Start Dust Sweep",
+          label: "View Dust Tokens",
+          href: `${url.href}?action=view`,
+          type: "transaction",
+        },
+        {
+          label: "Sweep Dust Tokens",
           href: `${url.href}?action=sweep`,
           type: "transaction",
         },
@@ -54,60 +93,59 @@ export async function GET(request: Request) {
 
 export const OPTIONS = GET;
 
-// POST endpoint for creating the swap transaction
-export async function POST(request: Request) {
+export async function POST(request: Request): Promise<Response> {
   try {
     const body: ActionPostRequest = await request.json();
     const url = new URL(request.url);
     const action = url.searchParams.get("action");
 
-    // Validate action
-    if (action !== "sweep") {
+    if (action !== "view" && action !== "sweep") {
       return Response.json(
         { error: { message: "Invalid action" } },
         { status: 400, headers: ACTION_HEADERS }
       );
     }
 
-    // Validate and get sender address
     let sender: PublicKey;
     try {
       sender = new PublicKey(body.account);
     } catch (error) {
-      console.log(error);
+      console.error(error);
       return Response.json(
         { error: { message: "Invalid account" } },
         { status: 400, headers: ACTION_HEADERS }
       );
     }
 
-    // Connect to Solana
     const connection = new Connection(clusterApiUrl("mainnet-beta"), "confirmed");
 
-    // Get token accounts
-    const tokenAccounts = await connection.getParsedTokenAccountsByOwner(sender, {
-      programId: new PublicKey("TokenkegQfeZyiNwAJbNmrSPv69Yr8BoYcVfRKr87Gd"),
-    });
+    const tokenAccounts = await retryWithBackoff(() => 
+      connection.getParsedTokenAccountsByOwner(sender, {
+        programId: new PublicKey("TokenkegQfeZyiNwAJbNmrSPv69Yr8BoYcVfRKr87Gd"),
+      })
+    );
 
-    // Process token accounts and find dust
-    const dustTokens = [];
-    for (const { account } of tokenAccounts.value) {
+    const dustTokens: DustToken[] = [];
+    for (const { account } of tokenAccounts.value as TokenAccount[]) {
       const parsedInfo = account.data.parsed.info;
-      const amount = parsedInfo.tokenAmount.uiAmount;
+      const uiAmount = parsedInfo.tokenAmount.uiAmount;
 
-      if (amount > 0) {
+      if (uiAmount > 0) {
         try {
-          // Get token price from Jupiter
-          const priceResponse = await axios.get(`https://price.jup.ag/v4/price?ids=${parsedInfo.mint}`, {
-            headers: ACTION_HEADERS,  // Include headers in this request
-          });
+          const priceResponse = await retryWithBackoff(() => 
+            axios.get(`https://price.jup.ag/v4/price?ids=${parsedInfo.mint}`, {
+              headers: ACTION_HEADERS,
+            })
+          );
           const price = priceResponse.data.data[parsedInfo.mint]?.price || 0;
-          const value = price * amount;
+          const value = price * uiAmount;
 
-          if (value > 0 && value < 5) { // Less than $5
+          if (value > 0 && value <= 5) {  
             dustTokens.push({
               mint: parsedInfo.mint,
-              amount: amount * Math.pow(10, parsedInfo.tokenAmount.decimals),
+              amount: parsedInfo.tokenAmount.amount,
+              uiAmount,
+              value,
             });
           }
         } catch (error) {
@@ -116,33 +154,46 @@ export async function POST(request: Request) {
       }
     }
 
-    // Create transaction
+    if (action === "view") {
+      const payload: ActionPostResponse = await createPostResponse({
+        fields: {
+          message: `Found ${dustTokens.length} dust tokens worth ≤ $5`,
+          type: "transaction",
+          transaction: new Transaction(),  
+        },
+      });
+
+      return new Response(JSON.stringify(payload), {
+        headers: ACTION_HEADERS,
+      });
+    }
+
     const transaction = new Transaction();
 
-    // Add swap instructions for each dust token
     for (const token of dustTokens) {
       try {
-        // Get Jupiter quote
-        const quoteResponse = await axios.get(JUPITER_QUOTE_API, {
-          params: {
-            inputMint: token.mint,
-            outputMint: USDC_MINT,
-            amount: token.amount.toString(),
-            slippageBps: 50,
-          },
-          headers: ACTION_HEADERS,  // Include headers in this request
-        });
+        const quoteResponse = await retryWithBackoff(() => 
+          axios.get(JUPITER_QUOTE_API, {
+            params: {
+              inputMint: token.mint,
+              outputMint: USDC_MINT,
+              amount: token.amount,
+              slippageBps: 50,
+            },
+            headers: ACTION_HEADERS,
+          })
+        );
 
-        // Get swap transaction
-        const swapResponse = await axios.post(JUPITER_SWAP_API, {
-          quoteResponse: quoteResponse.data,
-          userPublicKey: sender.toString(),
-          wrapUnwrapSOL: true,
-        }, {
-          headers: ACTION_HEADERS,  // Include headers in this request
-        });
+        const swapResponse = await retryWithBackoff(() => 
+          axios.post(JUPITER_SWAP_API, {
+            quoteResponse: quoteResponse.data,
+            userPublicKey: sender.toString(),
+            wrapUnwrapSOL: true,
+          }, {
+            headers: ACTION_HEADERS,
+          })
+        );
 
-        // Add swap instruction to transaction
         if (swapResponse.data.swapTransaction) {
           const swapTransactionBuf = Buffer.from(swapResponse.data.swapTransaction, 'base64');
           const swapTx = Transaction.from(swapTransactionBuf);
@@ -153,13 +204,13 @@ export async function POST(request: Request) {
       }
     }
 
-    // Get blockhash and set fee payer
-    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
+    const { blockhash, lastValidBlockHeight } = await retryWithBackoff(() => 
+      connection.getLatestBlockhash()
+    );
     transaction.recentBlockhash = blockhash;
     transaction.lastValidBlockHeight = lastValidBlockHeight;
     transaction.feePayer = sender;
 
-    // Create response
     const payload: ActionPostResponse = await createPostResponse({
       fields: {
         transaction,
@@ -180,3 +231,5 @@ export async function POST(request: Request) {
     );
   }
 }
+
+ 
